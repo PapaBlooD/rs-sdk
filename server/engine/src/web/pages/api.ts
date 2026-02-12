@@ -107,10 +107,15 @@ export function handleExportCollisionApi(url: URL): Response | null {
 
         console.log(`Exported ${tiles.length} tiles with collision, ${zones.length} zones allocated`);
 
-        // Scan loc map files for doors/gates (wall-shaped locs with "Open" option).
-        // The SDK uses this list to remove wall collision at door positions,
-        // so the pathfinder routes through doorways but respects permanent walls.
+        // Scan loc map files for blockwalk locs.
+        // Wall-layer locs (shapes 0-3, 9) with op1=Open become doors; op1=Close become closeDoors.
+        // Ground-layer locs (centrepieces etc.) with op1=Open become locGates; op1=Close become closeLocGates.
         const doors: Array<[number, number, number, number, number, number]> = [];
+        const closeDoors: Array<[number, number, number, number, number, number]> = [];
+        // Multi-tile openable locs (gates using centrepiece shapes): [level, x, z, width, length, angle, blockrange]
+        const locGates: Array<[number, number, number, number, number, number, number]> = [];
+        const closeLocGates: Array<[number, number, number, number, number, number, number]> = [];
+        const searchablePattern = /cupboard|chest|drawer|coffin|wardrobe|crate|barrel|bookcase|cabinet|shelf|table|desk|bench|stall|box|bin|sack|urn|hay|log pile|trap|closed/i;
         const MAPSQUARE_SIZE = 64;
         const LINK_BELOW = 0x2;
 
@@ -171,25 +176,41 @@ export function handleExportCollisionApi(url: URL): Response | null {
                     const angle = info & 0x3;
                     const locLayer = rsmod.locShapeLayer(shape);
 
-                    // Only interested in wall-shaped locs that are doors/gates
-                    if (locLayer !== LocLayer.WALL) continue;
-
                     const type = LocType.get(locId);
                     if (!type || !type.blockwalk) continue;
 
-                    // Check if this loc has an "Open" interaction option
-                    const hasOpen = type.op?.some((o: string | null) => o && /^open$/i.test(o));
-                    if (!hasOpen) continue;
+                    if (locLayer === LocLayer.WALL) {
+                        const hasOpen = type.op?.some((o: string | null) => o && /^open$/i.test(o));
+                        const hasClose = type.op?.some((o: string | null) => o && /^close$/i.test(o));
 
-                    doors.push([actualLevel, absoluteX, absoluteZ, shape, angle, type.blockrange ? 1 : 0]);
+                        if (hasOpen) {
+                            doors.push([actualLevel, absoluteX, absoluteZ, shape, angle, type.blockrange ? 1 : 0]);
+                        } else if (hasClose) {
+                            closeDoors.push([actualLevel, absoluteX, absoluteZ, shape, angle, type.blockrange ? 1 : 0]);
+                        }
+                    } else if (locLayer === LocLayer.GROUND) {
+                        const hasOpen = type.op?.some((o: string | null) => o && /^open$/i.test(o));
+                        const hasClose = type.op?.some((o: string | null) => o && /^close$/i.test(o));
+                        const name = type.name || '';
+
+                        if (hasOpen) {
+                            if (!searchablePattern.test(name)) {
+                                locGates.push([actualLevel, absoluteX, absoluteZ, type.width, type.length, angle, type.blockrange ? 1 : 0]);
+                            }
+                        } else if (hasClose) {
+                            if (!searchablePattern.test(name)) {
+                                closeLocGates.push([actualLevel, absoluteX, absoluteZ, type.width, type.length, angle, type.blockrange ? 1 : 0]);
+                            }
+                        }
+                    }
                 }
                 locIdOffset = locPacket.gsmarts();
             }
         }
 
-        console.log(`Found ${doors.length} openable doors/gates`);
+        console.log(`Found ${doors.length} openable doors/gates, ${closeDoors.length} default-open (closeable) doors/gates, ${locGates.length} loc gates, ${closeLocGates.length} close loc gates`);
 
-        return new Response(JSON.stringify({ tiles, zones, doors }), {
+        return new Response(JSON.stringify({ tiles, zones, doors, closeDoors, locGates, closeLocGates }), {
             headers: { 'Content-Type': 'application/json' }
         });
     } catch (e: any) {

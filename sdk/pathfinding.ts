@@ -9,6 +9,9 @@ interface CollisionData {
     tiles: Array<[number, number, number, number]>;
     zones: Array<[number, number, number]>;
     doors?: Array<[number, number, number, number, number, number]>; // [level, x, z, shape, angle, blockrange]
+    closeDoors?: Array<[number, number, number, number, number, number]>;
+    locGates?: Array<[number, number, number, number, number, number, number]>; // [level, x, z, width, length, angle, blockrange]
+    closeLocGates?: Array<[number, number, number, number, number, number, number]>;
 }
 
 export interface DoorInfo {
@@ -20,8 +23,23 @@ export interface DoorInfo {
     blockrange: boolean;
 }
 
+export interface LocGateInfo {
+    level: number;
+    x: number;
+    z: number;
+    width: number;
+    length: number;
+    angle: number;
+    blockrange: boolean;
+}
+
 // Spatial index of all known door positions, keyed by "level,x,z"
 const doorIndex = new Map<string, DoorInfo>();
+
+// Spatial index of multi-tile openable locs (centrepiece gates), keyed by anchor "level,x,z"
+const locGateIndex = new Map<string, LocGateInfo>();
+// Reverse index: every occupied tile "level,x,z" → gate anchor key "level,x,z"
+const locGateTileIndex = new Map<string, string>();
 
 // Zones that have at least one collision tile — zones with zero collision data
 // are likely open ocean/void and should not be treated as walkable land.
@@ -96,8 +114,77 @@ export function initPathfinding(): void {
         }
     }
 
+    // Add wall collision for default-open doors (closeDoors).
+    // These doors have no wall collision in the static map data because they
+    // spawn open. We add walls so the pathfinder treats them as closed,
+    // preventing routes through doorways that may be closed at runtime.
+    let closeDoorsAdded = 0;
+    if (data.closeDoors) {
+        for (const [level, x, z, shape, angle, blockrange] of data.closeDoors) {
+            rsmod.changeWall(x, z, level, angle, shape, !!blockrange, false, true);
+            rsmod.changeWall(x, z, level, angle, shape, !!blockrange, false, false);
+            const key = doorKey(level, x, z);
+            doorIndex.set(key, {
+                level, x, z, shape, angle, blockrange: !!blockrange
+            });
+            closeDoorsAdded++;
+        }
+    }
+
+    // Loc gates: multi-tile openable locs (centrepiece gates like Tree Gnome Stronghold).
+    // These use LOC collision (flag 256) over a width×length area, not wall collision.
+    // Unmask using changeLoc with rotation-aware dimensions.
+    let locGatesMasked = 0;
+    if (data.locGates) {
+        for (const [level, x, z, width, length, gateAngle, blockrange] of data.locGates) {
+            const key = doorKey(level, x, z);
+
+            // Rotation: angle NORTH(1) or SOUTH(3) swaps width/length
+            // (matches GameMap.changeLocCollision logic)
+            const rw = (gateAngle === 1 || gateAngle === 3) ? length : width;
+            const rl = (gateAngle === 1 || gateAngle === 3) ? width : length;
+
+            // Remove LOC collision over the multi-tile area
+            rsmod.changeLoc(x, z, level, rw, rl, !!blockrange, false, false);
+
+            const info: LocGateInfo = { level, x, z, width, length, angle: gateAngle, blockrange: !!blockrange };
+            locGateIndex.set(key, info);
+
+            // Populate tile index for all occupied tiles
+            for (let dx = 0; dx < rw; dx++) {
+                for (let dz = 0; dz < rl; dz++) {
+                    locGateTileIndex.set(doorKey(level, x + dx, z + dz), key);
+                }
+            }
+            locGatesMasked++;
+        }
+    }
+
+    // Close loc gates: default-open multi-tile locs — add then unmask
+    let closeLocGatesAdded = 0;
+    if (data.closeLocGates) {
+        for (const [level, x, z, width, length, gateAngle, blockrange] of data.closeLocGates) {
+            const rw = (gateAngle === 1 || gateAngle === 3) ? length : width;
+            const rl = (gateAngle === 1 || gateAngle === 3) ? width : length;
+
+            rsmod.changeLoc(x, z, level, rw, rl, !!blockrange, false, true);
+            rsmod.changeLoc(x, z, level, rw, rl, !!blockrange, false, false);
+
+            const key = doorKey(level, x, z);
+            const info: LocGateInfo = { level, x, z, width, length, angle: gateAngle, blockrange: !!blockrange };
+            locGateIndex.set(key, info);
+
+            for (let dx = 0; dx < rw; dx++) {
+                for (let dz = 0; dz < rl; dz++) {
+                    locGateTileIndex.set(doorKey(level, x + dx, z + dz), key);
+                }
+            }
+            closeLocGatesAdded++;
+        }
+    }
+
     initialized = true;
-    console.log(`Pathfinding initialized in ${Date.now() - start}ms (${data.zones.length} zones + ${mainlandZones} mainland fill, ${data.tiles.length} tiles, ${doorCount} doors masked, ${skippedOneWay} one-way doors blocked)`);
+    console.log(`Pathfinding initialized in ${Date.now() - start}ms (${data.zones.length} zones + ${mainlandZones} mainland fill, ${data.tiles.length} tiles, ${doorCount} doors masked, ${skippedOneWay} one-way doors blocked, ${closeDoorsAdded} close-doors walled, ${locGatesMasked} loc gates masked, ${closeLocGatesAdded} close-loc-gates)`);
 }
 
 // Check if a zone has collision data
@@ -190,6 +277,33 @@ export function findDoorsAlongPath(
     return doors;
 }
 
+/**
+ * Detect loc gates (multi-tile centrepiece locs) that a path crosses through.
+ * Similar to findDoorsAlongPath but checks the locGateTileIndex.
+ */
+export function findLocGatesAlongPath(
+    waypoints: Array<{ x: number; z: number; level: number }>
+): LocGateInfo[] {
+    if (waypoints.length < 2 || locGateTileIndex.size === 0) return [];
+
+    const gates: LocGateInfo[] = [];
+    const seen = new Set<string>();
+
+    for (const wp of waypoints) {
+        // Check if this tile is part of a loc gate
+        const anchorKey = locGateTileIndex.get(doorKey(wp.level, wp.x, wp.z));
+        if (anchorKey && !seen.has(anchorKey)) {
+            const gate = locGateIndex.get(anchorKey);
+            if (gate) {
+                seen.add(anchorKey);
+                gates.push(gate);
+            }
+        }
+    }
+
+    return gates;
+}
+
 /** Look up a door at an exact position. */
 export function getDoorAt(level: number, x: number, z: number): DoorInfo | undefined {
     return doorIndex.get(doorKey(level, x, z));
@@ -207,6 +321,32 @@ export function blockDoor(level: number, x: number, z: number): boolean {
     if (!door) return false;
     rsmod.changeWall(x, z, level, door.angle, door.shape, door.blockrange, false, true);
     doorIndex.delete(key);
+    return true;
+}
+
+/** Look up a loc gate by any tile it occupies. Returns the gate info if found. */
+export function getLocGateAt(level: number, x: number, z: number): LocGateInfo | undefined {
+    const anchorKey = locGateTileIndex.get(doorKey(level, x, z));
+    if (!anchorKey) return undefined;
+    return locGateIndex.get(anchorKey);
+}
+
+/** Re-add LOC collision for a loc gate that couldn't be opened. */
+export function blockLocGate(level: number, x: number, z: number): boolean {
+    if (!initialized) initPathfinding();
+    const key = doorKey(level, x, z);
+    const gate = locGateIndex.get(key);
+    if (!gate) return false;
+    const rw = (gate.angle === 1 || gate.angle === 3) ? gate.length : gate.width;
+    const rl = (gate.angle === 1 || gate.angle === 3) ? gate.width : gate.length;
+    rsmod.changeLoc(x, z, level, rw, rl, gate.blockrange, false, true);
+    locGateIndex.delete(key);
+    // Remove all tile index entries
+    for (let dx = 0; dx < rw; dx++) {
+        for (let dz = 0; dz < rl; dz++) {
+            locGateTileIndex.delete(doorKey(level, x + dx, z + dz));
+        }
+    }
     return true;
 }
 
